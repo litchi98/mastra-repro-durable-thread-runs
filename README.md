@@ -1,16 +1,16 @@
-# Repro: DurableAgent thread runs (total timeout, recovery suspension, aborted-run replay, wake crash window, pending-message replay) and redis-streams unsubscribe
+# Repro: DurableAgent thread runs (total timeout, recovery suspension, aborted-run replay, wake crash window, pending-message replay, cross-process resume) and redis-streams unsubscribe
 
 Minimal reproductions for Mastra bug reports about `DurableAgent` runs started through the thread API (`sendMessage` / `queueMessage` / `sendStreamResume` / `subscribeToThread`), and one about `@mastra/redis-streams`. Each report has its own script.
 
 - No API keys, no network: the model is a `MockLanguageModelV2` from `ai/test`.
 - Storage: libsql (in-memory, or a file under `.tmp/`).
-- PubSub: the in-process default for `total-timeout.ts`, `recovery-suspend.ts` and `wake-crash-window.ts`. `aborted-parked-replay.ts`, `redis-unsubscribe.ts` and `pending-presentation-replay.ts` need a local Redis (`REDIS_URL`, default `redis://127.0.0.1:6379`):
+- PubSub: the in-process default for `total-timeout.ts`, `recovery-suspend.ts` and `wake-crash-window.ts`. `aborted-parked-replay.ts`, `redis-unsubscribe.ts`, `pending-presentation-replay.ts` and `cross-process-resume-delivered.ts` need a local Redis (`REDIS_URL`, default `redis://127.0.0.1:6379`):
 
   ```bash
   docker run --rm -p 6379:6379 redis:7-alpine
   ```
 
-- Versions: `@mastra/core@1.83.0`, `@mastra/server@1.83.0`, `@mastra/memory@1.41.1`, `@mastra/libsql@1.30.0`, `@mastra/redis-streams@0.8.1`. Scripts 1–4: same results with `@mastra/core@1.84.0-alpha.4` / `@mastra/redis-streams@0.9.0-alpha.2` (`npm run use:alpha`). Scripts 5–6: same results with `@mastra/core@1.85.0-alpha.2`, `@mastra/server@1.85.0-alpha.2`, `@mastra/libsql@1.31.0`, `@mastra/memory@1.41.2`, `@mastra/redis-streams@0.9.0` (`npm run use:next`).
+- Versions: `@mastra/core@1.83.0`, `@mastra/server@1.83.0`, `@mastra/memory@1.41.1`, `@mastra/libsql@1.30.0`, `@mastra/redis-streams@0.8.1`. Scripts 1–4: same results with `@mastra/core@1.84.0-alpha.4` / `@mastra/redis-streams@0.9.0-alpha.2` (`npm run use:alpha`). Scripts 5–6: same results with `@mastra/core@1.85.0-alpha.2`, `@mastra/server@1.85.0-alpha.2`, `@mastra/libsql@1.31.0`, `@mastra/memory@1.41.2`, `@mastra/redis-streams@0.9.0` (`npm run use:next`). Script 7 was run on 1.84.0 (`npm run use:1.84`), 1.85.0-alpha.2 (`npm run use:next`) and 1.83.0; see its section.
 
 Environment: Node 26.13.0, npm 11.20.0, macOS 27 (arm64), Redis 7.4. Runtime only: no `mastra build` / `mastra dev` involved.
 
@@ -22,6 +22,7 @@ npm run repro:aborted-parked-replay  # 3 (Redis)
 npm run repro:redis-unsubscribe      # 4 (Redis)
 npm run repro:wake-crash-window      # 5
 npm run repro:pending-presentation-replay  # 6 (Redis)
+npm run repro:cross-process-resume-delivered  # 7 (Redis)
 ```
 
 `shared.ts` holds the mock model, the tools (`ask_user` suspends until it gets resume data, `lookup` returns right away), the agent factory and a `subscribeToThread({ withRunStatus: true })` logger.
@@ -224,3 +225,73 @@ Redis agent.thread-stream.user-1%00<thread>-crash (TTL 167 h), 8 entries:
 ### Expected
 
 A pending/queued presentation does not outlive the message it announces: e.g. publish it with the run's id (or the queued run's id) as the envelope `runId` so the run's trim removes it, have `subscribeToThread()` drop a pending chunk whose `user-message-delivered` comes later in the replay, and retract it (`data-user-message-cancelled`) when the process holding it is gone (its lease expired).
+
+---
+
+## 7. `cross-process-resume-delivered.ts`: a message delivered to a parked run is dropped when another process answers the run
+
+Two processes, A (the script) and B (a child), share a libsql file and a `RedisStreamsPubSub` (the thread lease lives in the PubSub's lease provider, so the in-process PubSub can't show this across processes). Both have `subscribeToThread()` open on the thread, as replicas behind a load balancer would for clients connected to either.
+
+1. A: `sendMessage('ask ...')` wakes a run; the model calls `ask_user`, which suspends. The run is parked in A, and A keeps the thread lease.
+2. B: `sendMessage('interjection ...')` returns `{ action: 'deliver', runId: <the parked run> }`.
+3. **Case A**: B answers the parked run with `sendStreamResume({ runId, toolCallId, resumeData })`. **Case B (control)**: A answers it.
+4. Wait 4 s, then 15 s more, and check the model prompts (each process logs its model calls) and memory.
+
+`SUBSCRIBE` (default `AB`) picks which processes open `subscribeToThread()` before the run starts; `ONLY_CASE_A=1` skips the control for repeated runs.
+
+### Actual output (1.84.0, a run where the message is lost)
+
+```
+Case A: B delivers a message to the run parked in A, then B answers the parked run
+  [A] sendMessage('ask (case-A)') -> wake
+  run parked on ask_user in A: yes
+  [B] sendMessage('interjection (case-A)') -> deliver (into the parked run)
+  [B] sendStreamResume({ resumeData: { answer: 'skip' } }) -> {"accepted":true}
+  model call after the resume [process B]: ["user: ask (case-A)","assistant: tool-call ask_user","tool: tool-result {\"answer\":\"skip\"}"]
+  stored messages: ["signal: ask (case-A)","assistant: after tool"]
+  19 s after the resume: further model calls: 0
+  stored messages: ["signal: ask (case-A)","assistant: after tool"]
+  listSuspendedRuns(): []
+
+Case B (control): B delivers a message to the run parked in A, then A answers the parked run
+  [A] sendMessage('ask (case-B)') -> wake
+  run parked on ask_user in A: yes
+  [B] sendMessage('interjection (case-B)') -> deliver (into the parked run)
+  [A] sendStreamResume({ resumeData: { answer: 'skip' } }) -> {"accepted":true}
+  model call after the resume [process A]: ["user: ask (case-B)","assistant: tool-call ask_user","tool: tool-result {\"answer\":\"skip\"}","user: interjection (case-B)"]
+  stored messages: ["signal: ask (case-B)","assistant: ","signal: interjection (case-B)","assistant: Reply to: interjection (case-B)"]
+  19 s after the resume: further model calls: 0
+  stored messages: ["signal: ask (case-B)","assistant: ","signal: interjection (case-B)","assistant: Reply to: interjection (case-B)"]
+  listSuspendedRuns(): []
+```
+
+In the other runs of case A, B's resumed segment still lacks the message, and A runs a separate turn for it after B's segment finishes:
+
+```
+  model call after the resume [process B]: ["user: ask (case-A)","assistant: tool-call ask_user","tool: tool-result {\"answer\":\"skip\"}"]
+  model call after the resume [process A]: ["user: ask (case-A)","assistant: tool-call ask_user","tool: tool-result {\"answer\":\"skip\"}","assistant: after tool","user: interjection (case-A)"]
+  stored messages: ["signal: ask (case-A)","assistant: after tool","signal: interjection (case-A)","assistant: Reply to: interjection (case-A)"]
+```
+
+### Readings (case A, subscriptions in A and B)
+
+| `@mastra/core` | message lost (no model call, not stored, 19 s) | answered by a separate turn in A | merged into B's resumed segment |
+| --- | --- | --- | --- |
+| 1.83.0 | 7 / 10 | 3 / 10 | 0 |
+| 1.84.0 | 3 / 10 | 7 / 10 | 0 |
+| 1.85.0-alpha.2 | 9 / 10 | 1 / 10 | 0 |
+
+Control (A answers): merged into the resumed segment in every run, on all three versions.
+
+Which processes subscribe changes the outcome (1.84.0, one run each):
+
+| `SUBSCRIBE` | case A |
+| --- | --- |
+| `AB` | see above |
+| `B` | not in B's segment; separate turn in A |
+| `A` | merged into B's segment |
+| none | merged into B's segment; A also makes one more model call with the same history plus B's reply (its output is not stored) |
+
+### Expected
+
+A message acknowledged as `deliver` into a parked run reaches that run's next segment, whichever process answers the run, as it does when the owner answers. At the least it is answered by a later turn, not dropped.
