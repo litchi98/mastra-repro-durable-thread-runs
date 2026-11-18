@@ -7,15 +7,20 @@
     "repro:recovery-suspend": "tsx recovery-suspend.ts",
     "repro:aborted-parked-replay": "tsx aborted-parked-replay.ts",
     "repro:redis-unsubscribe": "tsx redis-unsubscribe.ts",
-    "use:alpha": "npm install --legacy-peer-deps @mastra/core@1.84.0-alpha.4 @mastra/server@1.84.0-alpha.4 @mastra/libsql@1.31.0-alpha.2 @mastra/memory@1.41.2-alpha.2 @mastra/redis-streams@0.9.0-alpha.2"
+    "use:alpha": "npm install --legacy-peer-deps @mastra/core@1.84.0-alpha.4 @mastra/server@1.84.0-alpha.4 @mastra/libsql@1.31.0-alpha.2 @mastra/memory@1.41.2-alpha.2 @mastra/redis-streams@0.9.0-alpha.2",
+    "repro:wake-crash-window": "tsx wake-crash-window.ts",
+    "repro:pending-presentation-replay": "tsx pending-presentation-replay.ts",
+    "use:next": "npm install --legacy-peer-deps @mastra/core@1.85.0-alpha.2 @mastra/server@1.85.0-alpha.2 @mastra/libsql@1.31.0 @mastra/memory@1.41.2 @mastra/redis-streams@0.9.0"
   },
   "dependencies": {
+    "@libsql/client": "0.18.0",
     "@mastra/core": "1.83.0",
     "@mastra/libsql": "1.30.0",
     "@mastra/memory": "1.41.1",
     "@mastra/redis-streams": "0.8.1",
     "@mastra/server": "1.83.0",
     "ai": "5.0.290",
+    "redis": "5.12.1",
     "zod": "4.6.7"
   },
   "devDependencies": {

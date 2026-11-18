@@ -1,16 +1,16 @@
-# Repro: DurableAgent thread runs (total timeout, recovery suspension, aborted-run replay) and redis-streams unsubscribe
+# Repro: DurableAgent thread runs (total timeout, recovery suspension, aborted-run replay, wake crash window, pending-message replay) and redis-streams unsubscribe
 
-Minimal reproductions for three Mastra bug reports about `DurableAgent` runs started through the thread API (`sendMessage` / `sendStreamResume` / `subscribeToThread`), and one about `@mastra/redis-streams`. Each report has its own script.
+Minimal reproductions for Mastra bug reports about `DurableAgent` runs started through the thread API (`sendMessage` / `queueMessage` / `sendStreamResume` / `subscribeToThread`), and one about `@mastra/redis-streams`. Each report has its own script.
 
 - No API keys, no network: the model is a `MockLanguageModelV2` from `ai/test`.
 - Storage: libsql (in-memory, or a file under `.tmp/`).
-- PubSub: the in-process default for `total-timeout.ts` and `recovery-suspend.ts`. `aborted-parked-replay.ts` and `redis-unsubscribe.ts` need a local Redis (`REDIS_URL`, default `redis://127.0.0.1:6379`):
+- PubSub: the in-process default for `total-timeout.ts`, `recovery-suspend.ts` and `wake-crash-window.ts`. `aborted-parked-replay.ts`, `redis-unsubscribe.ts` and `pending-presentation-replay.ts` need a local Redis (`REDIS_URL`, default `redis://127.0.0.1:6379`):
 
   ```bash
   docker run --rm -p 6379:6379 redis:7-alpine
   ```
 
-- Versions: `@mastra/core@1.83.0`, `@mastra/server@1.83.0`, `@mastra/memory@1.41.1`, `@mastra/libsql@1.30.0`, `@mastra/redis-streams@0.8.1`. Same results with `@mastra/core@1.84.0-alpha.4` / `@mastra/redis-streams@0.9.0-alpha.2` (`npm run use:alpha`).
+- Versions: `@mastra/core@1.83.0`, `@mastra/server@1.83.0`, `@mastra/memory@1.41.1`, `@mastra/libsql@1.30.0`, `@mastra/redis-streams@0.8.1`. Scripts 1–4: same results with `@mastra/core@1.84.0-alpha.4` / `@mastra/redis-streams@0.9.0-alpha.2` (`npm run use:alpha`). Scripts 5–6: same results with `@mastra/core@1.85.0-alpha.2`, `@mastra/server@1.85.0-alpha.2`, `@mastra/libsql@1.31.0`, `@mastra/memory@1.41.2`, `@mastra/redis-streams@0.9.0` (`npm run use:next`).
 
 Environment: Node 26.13.0, npm 11.20.0, macOS 27 (arm64), Redis 7.4. Runtime only: no `mastra build` / `mastra dev` involved.
 
@@ -20,6 +20,8 @@ npm run repro:total-timeout          # 1
 npm run repro:recovery-suspend       # 2
 npm run repro:aborted-parked-replay  # 3 (Redis)
 npm run repro:redis-unsubscribe      # 4 (Redis)
+npm run repro:wake-crash-window      # 5
+npm run repro:pending-presentation-replay  # 6 (Redis)
 ```
 
 `shared.ts` holds the mock model, the tools (`ask_user` suspends until it gets resume data, `lookup` returns right away), the agent factory and a `subscribeToThread({ withRunStatus: true })` logger.
@@ -131,3 +133,94 @@ Each `unsubscribe()` waits up to `blockMs` for the reader's in-flight `XREADGROU
 ### Expected
 
 Unsubscribing an idle subscription doesn't wait for the blocking read, so `stopWorkers()` / `shutdown()` don't spend their drain budget on idle readers.
+
+---
+
+## 5. `wake-crash-window.ts`: a crash between the wake run's input save and its first running checkpoint leaves a stored user message that nothing answers
+
+`recovery: { durableAgents: 'auto' }`, libsql file storage, in-process PubSub.
+
+- **worker** (child process): `sendMessage('hello', { resourceId, threadId })` (wake). A wrapper on `memory.saveMessages()` SIGKILLs the worker as soon as the call that stored `hello` returns. That is the save in `DurableAgent.persistInitialInput()`, which runs before `executeWorkflow()` creates the run and before the first step writes the `running` checkpoint.
+- **this process**: reads storage, then calls `recoverAllDurableAgents()` every second for 40 s.
+
+Control (case B): the same crash later, while the step-1 model call hangs (after the first running checkpoint).
+
+### Actual output (1.83.0)
+
+```
+Case A: SIGKILL right after the wake run saved the user message (before any running checkpoint)
+  [worker] SIGKILLed
+  stored messages:        ["signal: hello"]
+  workflow snapshots:     []
+  run owner rows (db):    1
+  listActiveRuns():       []
+  recoverAllDurableAgents() every 1 s for 40.1 s -> recovered 0, skipped 0; last {"agents":1,"recovered":0,"succeeded":0,"failed":0,"skipped":0}
+  stored messages now:    ["signal: hello"]
+  sendMessage('next message') -> wake
+  user messages in the new run's model prompt: ["hello","next message"]
+  stored messages:        ["signal: hello","signal: next message","assistant: Reply to: next message"]
+
+Case B: control: SIGKILL while the step-1 model call hangs (after the first running checkpoint)
+  [worker] SIGKILLed
+  stored messages:        ["signal: hello"]
+  workflow snapshots:     [{"workflow_name":"durable-agentic-loop",...,"status":"running"},{"workflow_name":"durable-agentic-execution",...,"status":"running"}]
+  listActiveRuns():       ["<runId>"]
+  recoverAllDurableAgents() every 1 s for 15.1 s -> recovered 1, skipped 15; last {"agents":1,"recovered":1,"succeeded":1,"failed":0,"skipped":0}
+  stored messages now:    ["signal: hello","assistant: Reply to: hello"]
+```
+
+- The accepted user message is in memory, but the run has no snapshot at all, so `listActiveRuns()` / `recoverAllDurableAgents()` never see it. Its run-owner row is left behind.
+- Nothing answers `hello`. The next message wakes a new run that sees `hello` only as history and answers `next message`.
+- The docs say recovery is unavailable before the first running checkpoint. The problem is that the input is already saved at that point, so the crash leaves a stored, accepted message, and there is no public API to start a turn for it.
+
+### Expected
+
+Saving the accepted input and making the run recoverable happen together: e.g. write the restartable `pending` snapshot before the input save, or let recovery pick up a run-owner row whose run has no snapshot (or the thread's unanswered trailing user message). Otherwise, a public way to start a turn for a message that is already stored.
+
+---
+
+## 6. `pending-presentation-replay.ts`: `data-user-message-pending` stays in the thread stream and is replayed to every new subscriber
+
+`RedisStreamsPubSub`, libsql file storage.
+
+- **Control (no crash)**: `sendMessage('hold: first')` wakes a run whose model call waits; `queueMessage('second')` while it runs; then the run is released. Both messages are answered and stored.
+- **Crash**: the same in a worker process, which is then SIGKILLed while the first run is in its model call. This process recovers the first run (`recoverAllDurableAgents()`), then sends `third`, which is answered.
+- After each, new subscriptions in this process and in a fresh process, with and without `withInitialHistory`.
+
+### Actual output (1.83.0)
+
+```
+Control (no crash): sendMessage('hold: first') -> wake; queueMessage('second') while it runs -> deliver
+  stored messages: ["signal: hold: first","assistant: Reply to: hold: first","signal: second","assistant: Reply to: second"]
+  [same process] subscribeToThread():                             ["data-user-message-pending(<id of second>, queued)","thread-run-status:success","thread-run-status:success"]
+  [same process] subscribeToThread({ withInitialHistory: true }): ["thread-history(4 messages)","thread-run-status:success","thread-run-status:success"]
+  [new process]  subscribeToThread():                             ["data-user-message-pending(<id of second>, queued)","thread-run-status:success","thread-run-status:success"]
+  [new process]  subscribeToThread({ withInitialHistory: true }): ["thread-history(4 messages)","thread-run-status:success","thread-run-status:success"]
+
+Crash: the process holding the queued message is SIGKILLed
+  [worker] sendMessage('hold: first') -> wake; model call hangs
+  [worker] queueMessage('second') -> deliver
+  [worker] SIGKILLed
+  subscribeToThread({ withInitialHistory: true }) right after: ["thread-history(1 messages)","data-user-message-pending(<id of second>, queued)"]
+  recoverAllDurableAgents() -> {"agents":1,"recovered":1,"succeeded":1,"failed":0,"skipped":0} after 12.1 s
+  stored messages: ["signal: hold: first","assistant: Reply to: hold: first"]
+  sendMessage('third') -> wake
+  stored messages: ["signal: hold: first","assistant: Reply to: hold: first","signal: third","assistant: Reply to: third"]
+  Thread is idle; 'second' (lost with the worker) is not in history. New subscriptions:
+  [same process] subscribeToThread():                             ["data-user-message-pending(<id of second>, queued)","thread-run-status:success","thread-run-status:success"]
+  [same process] subscribeToThread({ withInitialHistory: true }): ["thread-history(4 messages)","data-user-message-pending(<id of second>, queued)","thread-run-status:success","thread-run-status:success"]
+  [new process]  subscribeToThread():                             ["data-user-message-pending(<id of second>, queued)","thread-run-status:success","thread-run-status:success"]
+  [new process]  subscribeToThread({ withInitialHistory: true }): ["thread-history(4 messages)","thread-run-status:success","thread-run-status:success","data-user-message-pending(<id of second>, queued)"]
+
+Redis agent.thread-stream.user-1%00<thread>-crash (TTL 167 h), 8 entries:
+  ["run-registered","user-message-delivered","user-message-presentation","run-registered","run-completed","run-registered","user-message-delivered","run-completed"]
+  user-message-presentation: envelope runId = "user-1\u0000<thread>-crash" (thread key), chunk data-user-message-pending(<id of second>, queued), chunk.runId = <runId of the first run>
+```
+
+- The `user-message-presentation` event is published with the thread key as its envelope `runId` (`#publishAndWait` uses `key` when the event has no top-level `runId`). `trimTopic({ runId })` matches the envelope `runId`, so the run's trims never remove it. It stays until the stream's idle TTL (7 days, renewed by every publish on the thread).
+- Control: after both runs finished and were trimmed, a subscriber without `withInitialHistory` still gets `second` as `queued`. The later `user-message-delivered` for it is in the stream, but the pending chunk is already yielded by then.
+- Crash: the queued message is lost with the worker and never reaches history. Every new subscriber, with or without history, gets it as pending, after the recovered run and a later run have finished.
+
+### Expected
+
+A pending/queued presentation does not outlive the message it announces: e.g. publish it with the run's id (or the queued run's id) as the envelope `runId` so the run's trim removes it, have `subscribeToThread()` drop a pending chunk whose `user-message-delivered` comes later in the replay, and retract it (`data-user-message-cancelled`) when the process holding it is gone (its lease expired).
